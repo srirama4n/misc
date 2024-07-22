@@ -1,0 +1,12 @@
+pyffx~=0.3.0
+pandas~=1.2.3
+faker~=26.0.0
+mimesis~=12.1.0
+ff3~=1.0.2
+presidio_analyzer
+presidio_anonymizer
+tabulate
+flask~=3.0.3
+pyspark~=3.5.1
+mediapipe~=0.9.1.0
+torch
