@@ -32,7 +32,7 @@ class SupportResult(BaseModel):
     risk: int = Field(description='Risk level of query', ge=0, le=10)
 
 model = OpenAIModel(model_name="gpt-4o-mini",
-                    api_key='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')
+                    api_key='')
 
 
 support_agent = Agent(

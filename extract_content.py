@@ -12,9 +12,9 @@ from langchain_openai import ChatOpenAI
 from browser_use import Agent
 
 
-llm = ChatOpenAI(model='gpt-4o-mini', api_key='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')
+llm = ChatOpenAI(model='gpt-4o-mini', api_key='')
 
-small_llm = ChatOpenAI(model='gpt-4o-mini', temperature=0.0, api_key='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')
+small_llm = ChatOpenAI(model='gpt-4o-mini', temperature=0.0, api_key='')
 
 agent = Agent(
 	task="Navigate to 'https://www.wellsfargo.com/help/security-and-fraud/passkey-faqs/' "
