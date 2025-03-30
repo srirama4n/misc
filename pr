@@ -15,3 +15,89 @@ Subject: [Main topic or focus]
 Details: [Additional contextual information]
 
 Confidence Score: [0-1]
+--------------------------
+
+Sure! Here’s the **structured prompt** you can use to extract all intents, confidence scores, slot information, urgency, and sentiment from a given text:  
+
+---
+
+### **Multi-Intent Extraction Prompt**  
+
+**Task:**  
+Analyze the given text to extract **all relevant intents**, assign **confidence scores**, extract **slots**, and determine **sentiment & urgency**.  
+
+**Instructions:**  
+1. Identify **all possible intents** in the text (not just the primary intent).  
+2. Assign a **confidence score (0-1)** to each intent.  
+3. Extract **key slots** that provide structured context.  
+4. Determine **sentiment** (positive/neutral/negative) and **urgency** (low/medium/high).  
+
+**Text:**  
+`[Insert Text Here]`  
+
+---
+
+### **Expected Output Format:**  
+
+```json
+{
+  "intents": [
+    {
+      "category": "[Intent Class - e.g., Inquiry, Request, Complaint, Feedback, Command, etc.]",
+      "confidence_score": [0-1]
+    },
+    {
+      "category": "[Another Relevant Intent]",
+      "confidence_score": [0-1]
+    }
+  ],
+  "slots": {
+    "action": "[What the user wants to do]",
+    "subject": "[Main topic or focus]",
+    "details": "[Additional context such as time, location, product, etc.]",
+    "urgency": "[Low / Medium / High]",
+    "sentiment": "[Positive / Neutral / Negative]"
+  }
+}
+```
+
+---
+
+### **Example Usage:**  
+
+**Input:**  
+> _"I need help with my order—it hasn't arrived yet, and customer support hasn't responded. I'm really frustrated and want a refund!"_  
+
+**Output:**  
+
+```json
+{
+  "intents": [
+    {
+      "category": "Request Assistance",
+      "confidence_score": 0.95
+    },
+    {
+      "category": "Complaint",
+      "confidence_score": 0.90
+    },
+    {
+      "category": "Refund Request",
+      "confidence_score": 0.88
+    }
+  ],
+  "slots": {
+    "action": "Request help, ask for a refund",
+    "subject": "Order delivery issue",
+    "details": "Order hasn't arrived, no response from support",
+    "urgency": "High",
+    "sentiment": "Negative"
+  }
+}
+```
+
+---
+
+This **structured prompt** ensures that all possible intents are extracted, ranked, and explained with relevant details. 🚀  
+
+Would you like industry-specific intent categories (e.g., customer service, healthcare, finance)?
