@@ -1,0 +1,17 @@
+Analyze the following text and extract the user's intent using intent classification, slot filling, and confidence scoring. Identify the primary intention behind the text, categorize it into a predefined intent class, and extract key entities (slots) that provide more context. Additionally, assign a confidence score (0-1) indicating the certainty of the classification."
+
+Text: [Insert Text Here]
+
+Output Format:
+
+Intent Class: [e.g., Inquiry, Request, Complaint, Feedback, Command, Emotional Expression, etc.]
+
+Extracted Slots:
+
+Action: [What action the user wants to take]
+
+Subject: [Main topic or focus]
+
+Details: [Additional contextual information]
+
+Confidence Score: [0-1]
