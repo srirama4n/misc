@@ -1,0 +1,854 @@
+Core node types (labels) & key properties
+
+User
+userId*, accountId, createdAt, locale, timeZone, deviceType, isVerified, segment
+
+Session
+sessionId*, channel, startedAt, endedAt, status, messageCount, avgLatencyMs
+
+Utterance (one row per message turn, user or bot)
+utteranceId*, direction (USER|BOT), text, lang, sentiment (-1..1), toxicityScore, intentScore, entitiesJson, turnIndex, latencyMs, createdAt
+
+Intent
+intentName*, version, confidenceAvg, domain, description
+
+EntityType
+name*, pattern, description
+
+Topic
+topicId*, name, taxonomyPath (e.g., Support>Billing>Refunds)
+
+Bot
+botId*, name, model, provider, version, temperature, systemPromptHash
+
+Channel
+channelId*, name (Web, WhatsApp, IVR, etc.), region
+
+Conversation (a logical thread that may span sessions)
+conversationId*, createdAt, resolvedAt, status, csat, nps
+
+Context (key/value bag captured at a time)
+contextId*, capturedAt, kv (map/json), source (client|server|integration)
+
+HealthMetric (per-user “healthiness/quality” snapshot)
+healthId*, capturedAt, engagementScore, frustrationScore, retentionRisk, churnRisk
+
+Attachment
+attachmentId*, mimeType, sizeBytes, sha256, uri
+
+Event (generic analytic event)
+eventId*, type, occurredAt, payloadJson
+
+Policy (for governance)
+policyId*, name, scope, piiLevel, retentionDays
+
+(* = natural key; also create a surrogate numeric id if your engine prefers.)
+
+Relationship types (direction →) & semantics
+
+USER →STARTED→ SESSION
+
+SESSION →HAS_UTTERANCE→ UTTERANCE (ordered by turnIndex)
+
+UTTERANCE →REPLY_TO→ UTTERANCE (threading/quote chains)
+
+UTTERANCE →ASSERTS_INTENT→ INTENT (confidence)
+
+UTTERANCE →MENTIONS_ENTITY→ EntityType (value, charStart, charEnd, confidence)
+
+UTTERANCE →ABOUT_TOPIC→ Topic (confidence)
+
+UTTERANCE →SENT_BY→ User (when direction=USER)
+
+UTTERANCE →GENERATED_BY→ Bot (when direction=BOT, include latencyMs, modelTokenUsage)
+
+SESSION →ON_CHANNEL→ Channel
+
+CONVERSATION →CONTAINS→ SESSION
+
+USER →PART_OF→ CONVERSATION (or CONVERSATION →WITH→ USER)
+
+CONTEXT →APPLIES_TO→ SESSION (or → UTTERANCE) (scope: session|utterance)
+
+USER →HAS_HEALTH→ HealthMetric
+
+UTTERANCE →HAS_ATTACHMENT→ Attachment
+
+EVENT →RELATES_TO→ {User|Session|Utterance|Conversation} (polymorphic via separate rels or a hub)
+
+POLICY →GOVERNS→ {User|Utterance|Attachment|Context}
+
+Property recommendations (mapping from your tables)
+
+Scores: csat, nps, sentiment, toxicityScore, engagementScore, frustrationScore (float)
+
+Timestamps as UTC ISO 8601; keep millisecond precision on createdAt/occurredAt
+
+Text fields: store raw in text, normalized in textNorm, embeddings as vectors if supported (or store vector id)
+
+Constraints & indexes (Neo4j Cypher)
+CREATE CONSTRAINT user_id IF NOT EXISTS FOR (n:User)        REQUIRE n.userId IS UNIQUE;
+CREATE CONSTRAINT sess_id IF NOT EXISTS FOR (n:Session)     REQUIRE n.sessionId IS UNIQUE;
+CREATE CONSTRAINT utt_id  IF NOT EXISTS FOR (n:Utterance)   REQUIRE n.utteranceId IS UNIQUE;
+CREATE CONSTRAINT conv_id IF NOT EXISTS FOR (n:Conversation)REQUIRE n.conversationId IS UNIQUE;
+CREATE CONSTRAINT intent_k IF NOT EXISTS FOR (n:Intent)     REQUIRE n.intentName IS UNIQUE;
+CREATE INDEX utt_created IF NOT EXISTS FOR (n:Utterance)    ON (n.createdAt);
+CREATE INDEX sess_started IF NOT EXISTS FOR (n:Session)     ON (n.startedAt);
+CREATE INDEX utt_text     IF NOT EXISTS FOR (n:Utterance)   ON (n.text);
+
+Minimal reference pattern (entity-relationship sketch in text)
+(User)-[:STARTED]->(Session)-[:HAS_UTTERANCE]->(Utterance)
+(Utterance)-[:SENT_BY]->(User)        | (Utterance)-[:GENERATED_BY]->(Bot)
+(Utterance)-[:ASSERTS_INTENT]->(Intent)
+(Utterance)-[:MENTIONS_ENTITY {value}]->(EntityType)
+(Utterance)-[:ABOUT_TOPIC]->(Topic)
+(Session)-[:ON_CHANNEL]->(Channel)
+(Conversation)-[:CONTAINS]->(Session)
+(Context)-[:APPLIES_TO]->(Session or Utterance)
+(User)-[:HAS_HEALTH]->(HealthMetric)
+(Utterance)-[:HAS_ATTACHMENT]->(Attachment)
+
+Example ingestion (from relational rows)
+// Upsert User
+MERGE (u:User {userId:$user_id})
+  ON CREATE SET u.createdAt = datetime($user_created_at),
+                u.locale = $locale, u.timeZone = $tz;
+
+// Upsert Session
+MERGE (s:Session {sessionId:$session_id})
+  ON CREATE SET s.startedAt = datetime($start_ts), s.channel = $channel
+  ON MATCH  SET s.endedAt   = coalesce(s.endedAt, datetime($end_ts));
+
+// Link User↔Session
+MERGE (u)-[:STARTED]->(s);
+
+// Utterance
+MERGE (m:Utterance {utteranceId:$utt_id})
+  ON CREATE SET m.createdAt = datetime($msg_ts), m.direction=$direction,
+                m.text=$text, m.lang=$lang, m.sentiment=$sentiment, m.turnIndex=$turn;
+
+// Link session to utterance
+MERGE (s)-[:HAS_UTTERANCE]->(m);
+
+// If BOT message, connect to Bot
+FOREACH (_ IN CASE WHEN $direction='BOT' THEN [1] ELSE [] END |
+  MERGE (b:Bot {botId:$bot_id})
+  MERGE (m)-[:GENERATED_BY {latencyMs:$latency}]->(b)
+);
+
+// Intent & entities (if present)
+FOREACH (i IN coalesce($intents,[]) |
+  MERGE (it:Intent {intentName:i.name})
+  MERGE (m)-[:ASSERTS_INTENT {confidence:i.confidence}]->(it)
+);
+FOREACH (e IN coalesce($entities,[]) |
+  MERGE (et:EntityType {name:e.type})
+  MERGE (m)-[:MENTIONS_ENTITY {value:e.value, confidence:e.confidence}]->(et)
+);
+
+Sample analytics queries
+
+Conversation timeline for a user
+
+MATCH (u:User {userId:$uid})-[:STARTED]->(s:Session)-[:HAS_UTTERANCE]->(m:Utterance)
+RETURN s.sessionId, m.turnIndex, m.direction, m.text, m.createdAt
+ORDER BY m.createdAt;
+
+
+Escalation risk: high frustration and low CSAT
+
+MATCH (u:User)-[:HAS_HEALTH]->(h:HealthMetric)
+WHERE h.frustrationScore > 0.7
+MATCH (u)-[:STARTED]->(:Session)-[:HAS_UTTERANCE]->(m:Utterance {direction:'USER'})
+WITH u, h, avg(m.sentiment) AS avgSent
+WHERE avgSent < 0
+RETURN u.userId, h.frustrationScore, avgSent
+ORDER BY h.frustrationScore DESC LIMIT 50;
+
+
+Top intents by channel last 7 days
+
+MATCH (:Session {channel:$channel})-[:HAS_UTTERANCE]->(m:Utterance)-[r:ASSERTS_INTENT]->(i:Intent)
+WHERE m.createdAt >= datetime() - duration('P7D')
+RETURN i.intentName, count(*) AS hits, avg(r.confidence) AS avgConf
+ORDER BY hits DESC;
+
+Governance & PII (recommended)
+
+Store PII only on User (minimize spread). Use a piiLevel on properties or protect with a POLICY →GOVERNS link.
+
+Keep attachments off-cluster (URI only) and hash with sha256.
+
+Add retentionDays on Policy; periodic job deletes old Utterance.text but retains aggregates.
+
+Optional RDF/OWL mapping (if you need semantic web)
+
+Classes: ex:User, ex:Session, ex:Utterance, ex:Intent, ex:EntityType, ex:Bot, ex:Channel, ex:Conversation, ex:Context, ex:HealthMetric.
+
+Object properties: ex:started, ex:hasUtterance, ex:sentBy, ex:generatedBy, ex:assertsIntent, ex:mentionsEntity, ex:aboutTopic, ex:onChannel, ex:contains, ex:appliesTo, ex:hasHealth.
+
+Datatype properties mirror node properties (ex:createdAt xsd:dateTime, ex:sentiment xsd:float, etc.)
+
+
+graph TD
+  %% Nodes
+  User[[User]]
+  Session[[Session]]
+  Utterance[[Utterance]]
+  Bot[[Bot]]
+  Intent[[Intent]]
+  EntityType[[EntityType]]
+  Topic[[Topic]]
+  Channel[[Channel]]
+  Conversation[[Conversation]]
+  Context[[Context]]
+  HealthMetric[[HealthMetric]]
+  Attachment[[Attachment]]
+  Event[[Event]]
+  Policy[[Policy]]
+
+  %% Relationships
+  User -- STARTED --> Session
+  Session -- HAS_UTTERANCE --> Utterance
+  Utterance -- SENT_BY --> User
+  Utterance -- GENERATED_BY --> Bot
+  Utterance -- ASSERTS_INTENT --> Intent
+  Utterance -- MENTIONS_ENTITY --> EntityType
+  Utterance -- ABOUT_TOPIC --> Topic
+  Session -- ON_CHANNEL --> Channel
+  Conversation -- CONTAINS --> Session
+  Context -- APPLIES_TO --> Session
+  Context -- APPLIES_TO --> Utterance
+  User -- HAS_HEALTH --> HealthMetric
+  Utterance -- HAS_ATTACHMENT --> Attachment
+  Event -- RELATES_TO --> User
+  Event -- RELATES_TO --> Session
+  Event -- RELATES_TO --> Utterance
+  Policy -- GOVERNS --> User
+  Policy -- GOVERNS --> Utterance
+  Policy -- GOVERNS --> Attachment
+
+
+
+Neo4j seed script (constraints + small realistic dataset)
+
+Paste into Neo4j Browser or run via cypher-shell. It’s idempotent (uses MERGE) and safe to rerun.
+
+// ---------- CONSTRAINTS & INDEXES ----------
+CREATE CONSTRAINT user_id IF NOT EXISTS        FOR (n:User)        REQUIRE n.userId IS UNIQUE;
+CREATE CONSTRAINT sess_id IF NOT EXISTS        FOR (n:Session)     REQUIRE n.sessionId IS UNIQUE;
+CREATE CONSTRAINT utt_id  IF NOT EXISTS        FOR (n:Utterance)   REQUIRE n.utteranceId IS UNIQUE;
+CREATE CONSTRAINT conv_id IF NOT EXISTS        FOR (n:Conversation)REQUIRE n.conversationId IS UNIQUE;
+CREATE CONSTRAINT intent_k IF NOT EXISTS       FOR (n:Intent)      REQUIRE n.intentName IS UNIQUE;
+CREATE CONSTRAINT ent_k IF NOT EXISTS          FOR (n:EntityType)  REQUIRE n.name IS UNIQUE;
+CREATE CONSTRAINT topic_k IF NOT EXISTS        FOR (n:Topic)       REQUIRE n.topicId IS UNIQUE;
+CREATE CONSTRAINT bot_k IF NOT EXISTS          FOR (n:Bot)         REQUIRE n.botId IS UNIQUE;
+CREATE CONSTRAINT channel_k IF NOT EXISTS      FOR (n:Channel)     REQUIRE n.channelId IS UNIQUE;
+CREATE CONSTRAINT context_k IF NOT EXISTS      FOR (n:Context)     REQUIRE n.contextId IS UNIQUE;
+CREATE CONSTRAINT health_k IF NOT EXISTS       FOR (n:HealthMetric)REQUIRE n.healthId IS UNIQUE;
+CREATE CONSTRAINT attach_k IF NOT EXISTS       FOR (n:Attachment)  REQUIRE n.attachmentId IS UNIQUE;
+CREATE CONSTRAINT event_k IF NOT EXISTS        FOR (n:Event)       REQUIRE n.eventId IS UNIQUE;
+CREATE CONSTRAINT policy_k IF NOT EXISTS       FOR (n:Policy)      REQUIRE n.policyId IS UNIQUE;
+
+CREATE INDEX utt_created IF NOT EXISTS FOR (n:Utterance) ON (n.createdAt);
+CREATE INDEX sess_started IF NOT EXISTS FOR (n:Session)  ON (n.startedAt);
+CREATE INDEX utt_text IF NOT EXISTS     FOR (n:Utterance) ON (n.text);
+
+// ---------- CORE NODES ----------
+MERGE (u1:User {userId:'U1001'})
+  ON CREATE SET u1.createdAt = datetime(), u1.locale='en-IN', u1.timeZone='Asia/Kolkata', u1.segment='retail';
+
+MERGE (u2:User {userId:'U2001'})
+  ON CREATE SET u2.createdAt = datetime(), u2.locale='en-US', u2.timeZone='America/New_York', u2.segment='vip';
+
+MERGE (b1:Bot {botId:'B-Assist'})
+  ON CREATE SET b1.name='Support Assist', b1.model='gpt-4o', b1.provider='OpenAI', b1.version='1.7', b1.temperature=0.3;
+
+MERGE (ch1:Channel {channelId:'web'})
+  ON CREATE SET ch1.name='Web', ch1.region='IN';
+
+MERGE (ch2:Channel {channelId:'whatsapp'})
+  ON CREATE SET ch2.name='WhatsApp', ch2.region='US';
+
+MERGE (conv1:Conversation {conversationId:'C-90001'})
+  ON CREATE SET conv1.createdAt=datetime(), conv1.status='open';
+
+MERGE (pol1:Policy {policyId:'PII-STD-01'})
+  ON CREATE SET pol1.name='PII Standard', pol1.scope='customer-data', pol1.piiLevel='high', pol1.retentionDays=365;
+
+// ---------- TAXONOMY / NLP ----------
+MERGE (iRefund:Intent {intentName:'request_refund'}) ON CREATE SET iRefund.domain='Billing', iRefund.version='v1';
+MERGE (iTrack:Intent  {intentName:'track_order'})   ON CREATE SET iTrack.domain='Orders',  iTrack.version='v2';
+
+MERGE (eOrderId:EntityType {name:'order_id'}) ON CREATE SET eOrderId.pattern='[A-Z]{3}\\d{6}';
+MERGE (eReason:EntityType  {name:'refund_reason'});
+
+MERGE (tBilling:Topic {topicId:'T-Billing'}) ON CREATE SET tBilling.name='Billing', tBilling.taxonomyPath='Support>Billing';
+MERGE (tOrders:Topic  {topicId:'T-Orders'})  ON CREATE SET tOrders.name='Orders',  tOrders.taxonomyPath='Support>Orders';
+
+// ---------- SESSIONS ----------
+MERGE (s1:Session {sessionId:'S-10001'})
+  ON CREATE SET s1.startedAt=datetime({epochMillis: timestamp()-600000}), s1.status='active', s1.messageCount=0, s1.avgLatencyMs=0, s1.channel='web';
+
+MERGE (s2:Session {sessionId:'S-20001'})
+  ON CREATE SET s2.startedAt=datetime({epochMillis: timestamp()-3600000}), s2.endedAt=datetime(), s2.status='closed', s2.messageCount=0, s2.avgLatencyMs=0, s2.channel='whatsapp';
+
+// ---------- RELATE USER/SESSION/CONVERSATION/CHANNEL ----------
+MERGE (u1)-[:STARTED]->(s1);
+MERGE (u2)-[:STARTED]->(s2);
+MERGE (conv1)-[:CONTAINS]->(s1);
+MERGE (conv1)-[:CONTAINS]->(s2);
+MERGE (s1)-[:ON_CHANNEL]->(ch1);
+MERGE (s2)-[:ON_CHANNEL]->(ch2);
+
+// ---------- UTTERANCES (timeline for s1) ----------
+MERGE (m1:Utterance {utteranceId:'M-1'})
+  ON CREATE SET m1.createdAt = datetime({epochMillis: timestamp()-590000}),
+                m1.direction='USER', m1.text='Hi, I need a refund for my order ORD123456.',
+                m1.lang='en', m1.sentiment=-0.1, m1.turnIndex=1, m1.latencyMs=0;
+
+MERGE (m2:Utterance {utteranceId:'M-2'})
+  ON CREATE SET m2.createdAt = datetime({epochMillis: timestamp()-585000}),
+                m2.direction='BOT', m2.text='Sure, can you share the reason for refund?',
+                m2.lang='en', m2.sentiment=0.1, m2.turnIndex=2, m2.latencyMs=750;
+
+MERGE (m3:Utterance {utteranceId:'M-3'})
+  ON CREATE SET m3.createdAt = datetime({epochMillis: timestamp()-580000}),
+                m3.direction='USER', m3.text='Item arrived damaged. Here is a photo.',
+                m3.lang='en', m3.sentiment=-0.2, m3.turnIndex=3, m3.latencyMs=0;
+
+MERGE (s1)-[:HAS_UTTERANCE]->(m1);
+MERGE (s1)-[:HAS_UTTERANCE]->(m2);
+MERGE (s1)-[:HAS_UTTERANCE]->(m3);
+
+MERGE (m1)-[:SENT_BY]->(u1);
+MERGE (m2)-[:GENERATED_BY {latencyMs:750, tokenUsage:450}]->(b1);
+MERGE (m3)-[:SENT_BY]->(u1);
+
+// intents/entities/topics
+MERGE (m1)-[:ASSERTS_INTENT {confidence:0.92}]->(iRefund);
+MERGE (m1)-[:MENTIONS_ENTITY {value:'ORD123456', confidence:0.99}]->(eOrderId);
+MERGE (m1)-[:ABOUT_TOPIC {confidence:0.9}]->(tBilling);
+MERGE (m3)-[:MENTIONS_ENTITY {value:'damaged_item', confidence:0.7}]->(eReason);
+MERGE (m3)-[:ABOUT_TOPIC {confidence:0.7}]->(tBilling);
+
+// ---------- ATTACHMENT ----------
+MERGE (att1:Attachment {attachmentId:'A-1'})
+  ON CREATE SET att1.mimeType='image/jpeg', att1.sizeBytes=245678, att1.sha256='abc123...', att1.uri='s3://bucket/proof.jpg';
+MERGE (m3)-[:HAS_ATTACHMENT]->(att1);
+
+// ---------- CONTEXT ----------
+MERGE (ctx1:Context {contextId:'CTX-1'})
+  ON CREATE SET ctx1.capturedAt=datetime(), ctx1.source='client',
+                ctx1.kv = {browser:'Chrome', os:'Android', abTest:'checkout-v2'};
+MERGE (ctx1)-[:APPLIES_TO]->(s1);
+
+MERGE (ctx2:Context {contextId:'CTX-2'})
+  ON CREATE SET ctx2.capturedAt=datetime(), ctx2.source='server',
+                ctx2.kv = {geo:'IN', ip:'203.0.113.5'};
+MERGE (ctx2)-[:APPLIES_TO]->(m1);
+
+// ---------- HEALTH METRICS ----------
+MERGE (h1:HealthMetric {healthId:'H-U1001-1'})
+  ON CREATE SET h1.capturedAt=datetime(), h1.engagementScore=0.72, h1.frustrationScore=0.35, h1.retentionRisk=0.18, h1.churnRisk=0.12;
+MERGE (u1)-[:HAS_HEALTH]->(h1);
+
+// ---------- EVENTS ----------
+MERGE (ev1:Event {eventId:'EV-1'})
+  ON CREATE SET ev1.type='refund_flow_started', ev1.occurredAt=datetime(), ev1.payloadJson={order:'ORD123456'};
+MERGE (ev1)-[:RELATES_TO]->(u1);
+MERGE (ev1)-[:RELATES_TO]->(s1);
+MERGE (ev1)-[:RELATES_TO]->(m1);
+
+// ---------- GOVERNANCE ----------
+MERGE (pol1)-[:GOVERNS]->(u1);
+MERGE (pol1)-[:GOVERNS]->(m1);
+MERGE (pol1)-[:GOVERNS]->(att1);
+
+// ---------- QUICK ROLLOUPS ----------
+MATCH (s1:Session {sessionId:'S-10001'})-[:HAS_UTTERANCE]->(m:Utterance)
+WITH s1, count(m) AS c, avg(m.latencyMs) AS al
+SET s1.messageCount = c, s1.avgLatencyMs = coalesce(al,0);
+
+// ---------- OPTIONAL: SECOND SESSION (summary only) ----------
+MERGE (m4:Utterance {utteranceId:'M-4'})
+  ON CREATE SET m4.createdAt = datetime({epochMillis: timestamp()-3500000}),
+                m4.direction='USER', m4.text='Where is my package ORD654321?', m4.turnIndex=1, m4.lang='en', m4.sentiment:=-0.05;
+MERGE (s2)-[:HAS_UTTERANCE]->(m4)
+MERGE (m4)-[:SENT_BY]->(u2)
+MERGE (m4)-[:ASSERTS_INTENT {confidence:0.87}]->(iTrack)
+MERGE (m4)-[:MENTIONS_ENTITY {value:'ORD654321', confidence:0.98}]->(eOrderId)
+MERGE (m4)-[:ABOUT_TOPIC {confidence:0.9}]->(tOrders);
+
+Handy test queries
+// Conversation timeline
+MATCH (u:User {userId:'U1001'})-[:STARTED]->(s)-[:HAS_UTTERANCE]->(m)
+RETURN s.sessionId, m.turnIndex, m.direction, m.text, m.createdAt
+ORDER BY m.createdAt;
+
+// Top intents in last 7 days by channel
+MATCH (:Session {channel:'web'})-[:HAS_UTTERANCE]->(m)-[r:ASSERTS_INTENT]->(i:Intent)
+WHERE m.createdAt >= datetime() - duration('P7D')
+RETURN i.intentName, count(*) AS hits, avg(r.confidence) AS avgConf
+ORDER BY hits DESC;
+
+
+🚀 Project: Conversational Graph Data Ontology & Integration
+
+Goal:
+Design, build, and populate a graph-based data model (Neo4j/TigerGraph) from existing relational chat datasets (utterance, session, context, health, etc.) for analytics, intent tracking, and knowledge discovery.
+
+Duration: 6–8 weeks (can adjust for resource availability)
+
+🧩 Project Structure (Epics)
+Epic	Objective	Key Deliverables
+E1. Requirements & Discovery	Understand existing data model, key KPIs, and usage scenarios	Data dictionary, ontology scope doc
+E2. Ontology Design	Define entities, relationships, and semantics	Finalized ontology (Mermaid + schema spec)
+E3. Graph Platform Setup	Install/configure Neo4j or TigerGraph environment	Running graph DB instance + security setup
+E4. Data Ingestion Pipeline	Migrate data from relational sources	ETL scripts, mapping tables, data validation
+E5. Knowledge Graph Build & Validation	Load, validate, and test the ontology structure	Populated graph, relationship metrics
+E6. Query Layer & Analytics	Build Cypher queries and dashboards	Query library, metrics dashboard
+E7. Governance & Documentation	Define PII, access, and retention policies	Policy matrix + full documentation
+🗓️ Timeline (High-Level Plan)
+Week	Focus	Key Output
+1	Requirements, data exploration	Data model inventory
+2	Ontology design & review	Entity-relationship schema
+3	Platform setup & config	Neo4j environment ready
+4–5	ETL & ingestion (relational → graph)	Loaded sample datasets
+6	Query creation, dashboards	Cypher query set, KPI dashboard
+7	Policy, validation, documentation	Security matrix, doc site
+8 (optional)	Optimization, production rollout	Final handover
+🧱 Jira Backlog — Stories by Epic
+Epic E1: Requirements & Discovery
+
+Story 1.1 – Data Source Inventory
+As a data engineer, I want to inventory all chat-related tables and schemas so that I understand what data to model.
+Acceptance: Table names, keys, and record counts documented.
+
+Story 1.2 – Identify Use Cases
+As a product analyst, I want to define key use cases for conversational graph analytics so we design with purpose.
+Acceptance: 5–10 defined use cases (e.g., sentiment flow, intent frequency).
+
+Story 1.3 – KPI Definition
+As a data lead, I want to define core metrics (CSAT, sentiment, intent confidence) to extract from the graph.
+Acceptance: KPI list with definitions and formulas.
+
+Epic E2: Ontology Design
+
+Story 2.1 – Draft Ontology Model
+Design initial node & relationship model (User, Session, Utterance, Intent...)
+Acceptance: Mermaid diagram & schema spec shared for review.
+
+Story 2.2 – Define Node Properties
+As a data modeler, define all node properties and data types mapped from source columns.
+Acceptance: Property dictionary completed.
+
+Story 2.3 – Define Relationship Semantics
+As a graph architect, define relationship names, directions, and key attributes.
+Acceptance: Graph model documented with sample Cypher relationships.
+
+Story 2.4 – Review & Approval
+Conduct stakeholder review session.
+Acceptance: Approved version of ontology.
+
+Epic E3: Graph Platform Setup
+
+Story 3.1 – Environment Provisioning
+Spin up Neo4j/TigerGraph instance (cloud or on-prem).
+Acceptance: Accessible instance with credentials.
+
+Story 3.2 – Security & Access Control
+Configure user roles and data access policies.
+Acceptance: Roles defined for admin, developer, analyst.
+
+Story 3.3 – Tooling Integration
+Integrate with APOC, Bloom, or GDS libraries.
+Acceptance: Tools tested in environment.
+
+Epic E4: Data Ingestion Pipeline
+
+Story 4.1 – Source-to-Target Mapping
+Define relational → graph mappings for each table.
+Acceptance: Mapping sheet with columns, node, relationship mapping.
+
+Story 4.2 – Build ETL Scripts
+Develop scripts using Neo4j’s LOAD CSV or APOC.LOAD.JDBC.
+Acceptance: Working ingestion scripts with sample data.
+
+Story 4.3 – Data Validation Rules
+Define data quality checks.
+Acceptance: Validation report on row/edge counts, missing keys.
+
+Story 4.4 – Incremental Load Support
+Add logic for daily delta loads.
+Acceptance: ETL rerun supports upserts without duplication.
+
+Epic E5: Knowledge Graph Build & Validation
+
+Story 5.1 – Initial Graph Population
+Load 10k sample records and build base relationships.
+Acceptance: Graph populated and browsable.
+
+Story 5.2 – Model Validation
+Verify all relationships and counts match source expectations.
+Acceptance: Validation report signed off.
+
+Story 5.3 – Performance Tuning
+Optimize indexes, constraints, and query speed.
+Acceptance: Average Cypher query < 1s for key queries.
+
+Epic E6: Query Layer & Analytics
+
+Story 6.1 – Query Library Creation
+Develop reusable Cypher queries for KPIs (intent trends, session drop-off, sentiment flow).
+Acceptance: 10+ validated queries stored in repo.
+
+Story 6.2 – Visualization Dashboard
+Integrate Neo4j Bloom or PowerBI/Tableau for graph visualization.
+Acceptance: Working dashboard with KPIs.
+
+Story 6.3 – Export API
+Expose REST/GraphQL API to query data externally.
+Acceptance: Sample API endpoint for intent search.
+
+Epic E7: Governance & Documentation
+
+Story 7.1 – PII Policy Definition
+Define which nodes contain sensitive data and retention policy.
+Acceptance: PII classification matrix approved.
+
+Story 7.2 – Access & Retention Controls
+Implement access limits per policy.
+Acceptance: Role-based masking or deletion jobs configured.
+
+Story 7.3 – Documentation & Training
+Publish final ontology, Cypher examples, and onboarding guide.
+Acceptance: Wiki page live with examples.
+
+⚙️ Jira Task Template (for import)
+Key	Summary	Epic Link	Story Points	Assignee	Status
+KG-1	Data Source Inventory	E1	3		To Do
+KG-2	Identify Use Cases	E1	2		To Do
+KG-3	Draft Ontology Model	E2	5		In Progress
+KG-4	Define Node Properties	E2	3		To Do
+KG-5	Graph Environment Setup	E3	5		To Do
+KG-6	Source-to-Target Mapping	E4	5		To Do
+KG-7	Build ETL Script for Utterances	E4	8		To Do
+KG-8	Validate Graph Counts	E5	3		To Do
+KG-9	Create KPI Query Library	E6	5		To Do
+KG-10	Define PII & Retention Policy	E7	3		To Do
+KG-11	Publish Final Documentation	E7	2		To Do
+🧭 Deliverables Summary
+Deliverable	Owner	Output
+Data Dictionary	Data Engineer	Excel / Confluence table
+Ontology Diagram	Architect	Mermaid + PDF
+Graph Schema Script	Data Engineer	Cypher script
+ETL Mapping	Integration Dev	Mapping sheet
+Sample Loaded Graph	Engineer	Neo4j instance
+KPI Queries	Data Analyst	Query repo
+Dashboard	Analyst	PowerBI/Bloom view
+Documentation	Architect	Confluence doc set
+
+Would you like me to export this as a Jira importable CSV (ready to upload into Jira Software), or format it into a Confluence-style project plan with checklists and timelines?
+
+You said:
+Confluence-style project plan
+ChatGPT said:
+
+Perfect ✅
+Here’s a Confluence-style project plan you can paste directly into a Confluence page — fully formatted with sections, collapsible headers, timelines, and tables (ready for your “Project: Conversational Graph Data Ontology”).
+
+You can copy-paste this into a Confluence page (in wiki markup or visual editor) and it will render cleanly with headings, bullet points, and checklists.
+
+🧠 Conversational Graph Data Ontology – Project Plan
+📋 Project Overview
+
+Project Name: Conversational Graph Data Ontology
+Owner: Data Engineering & AI Analytics Team
+Project Duration: ~8 Weeks
+Objective:
+To design and implement a graph-based data ontology that connects user, session, utterance, intent, and sentiment data into a unified knowledge graph for analytics, insight generation, and model improvement.
+
+🎯 Goals & Outcomes
+Goal	Description	Outcome
+Unify chat data	Integrate user sessions, utterances, intents, and context	Single graph structure
+Enable semantic analytics	Allow deep relationship queries (intent, sentiment, topic)	Query-ready Neo4j DB
+Improve visibility	Surface conversation-level insights (flow, escalation, churn risk)	Dashboards & Cypher library
+Governance & PII protection	Define access and retention policies	Policy & security documentation
+🧩 Project Phases
+
+Below are the major phases, deliverables, and expected outcomes.
+
+🔹 Phase 1: Requirements & Discovery (Week 1)
+
+Objective: Understand existing relational structures, usage needs, and metrics.
+
+Deliverables:
+
+Data source inventory
+
+KPI and analytics use case definitions
+
+Current schema and column mapping
+
+Stakeholder alignment session
+
+Tasks:
+
+ Inventory chat, session, utterance, and context tables
+
+ Identify key KPIs (CSAT, sentiment flow, latency)
+
+ Document table relationships and foreign keys
+
+ Create initial data volume and quality report
+
+Artifacts:
+
+Data_Model_Inventory.xlsx
+
+Use_Case_Definition.docx
+
+🔹 Phase 2: Ontology Design (Week 2)
+
+Objective: Define entities, relationships, and property structures for the graph.
+
+Deliverables:
+
+Entity-Relationship schema
+
+Property and relationship dictionary
+
+Mermaid-based ontology diagram
+
+Tasks:
+
+ Design node types (User, Session, Utterance, Intent, Entity, Bot, Context, etc.)
+
+ Define all relationships and semantics (HAS_UTTERANCE, ASSERTS_INTENT, etc.)
+
+ Create final ontology diagram
+
+ Review with stakeholders
+
+Artifacts:
+
+Ontology_Spec.md
+
+Graph_Model_Diagram.mmd
+
+Schema_Property_Dictionary.xlsx
+
+🔹 Phase 3: Graph Platform Setup (Week 3)
+
+Objective: Set up and secure Neo4j (or TigerGraph) environment.
+
+Deliverables:
+
+Configured Neo4j instance
+
+Access control and role setup
+
+Basic plugins (APOC, Bloom, GDS)
+
+Tasks:
+
+ Provision graph environment (cloud/on-prem)
+
+ Configure security and authentication
+
+ Enable APOC and GDS extensions
+
+ Test connectivity from engineering environment
+
+Artifacts:
+
+Neo4j_Config_Guide.md
+
+Access_Control_Matrix.xlsx
+
+🔹 Phase 4: Data Ingestion Pipeline (Weeks 4–5)
+
+Objective: Migrate relational data into the graph using defined mappings.
+
+Deliverables:
+
+Source-to-target data mapping
+
+ETL scripts (Cypher / APOC / Python)
+
+Validation reports
+
+Tasks:
+
+ Create mapping document for each source table
+
+ Develop ETL for User, Session, Utterance nodes
+
+ Add relationships (HAS_UTTERANCE, ASSERTS_INTENT, etc.)
+
+ Validate node/edge counts
+
+ Implement incremental load support
+
+Artifacts:
+
+ETL_Mapping_Spec.xlsx
+
+Load_Scripts.cypher
+
+Validation_Report.xlsx
+
+🔹 Phase 5: Knowledge Graph Build & Validation (Week 6)
+
+Objective: Build, test, and optimize the graph data structure.
+
+Deliverables:
+
+Populated graph database
+
+Indexes, constraints, and performance tuning
+
+Model validation and audit report
+
+Tasks:
+
+ Run full data load
+
+ Create constraints and indexes
+
+ Validate entity and relationship integrity
+
+ Optimize query performance
+
+Artifacts:
+
+Validation_Report.xlsx
+
+Performance_Tuning_Log.md
+
+🔹 Phase 6: Query Layer & Analytics (Week 7)
+
+Objective: Develop insights and query interfaces.
+
+Deliverables:
+
+Cypher query library
+
+Visualization dashboard (Bloom or Power BI)
+
+API endpoints for integration
+
+Tasks:
+
+ Develop standard Cypher queries for KPIs
+
+ Create Bloom visualization templates
+
+ Integrate with BI tool (optional)
+
+ Build API layer for external access
+
+Artifacts:
+
+Cypher_Query_Library.cypher
+
+KPI_Dashboard.pbix
+
+GraphQL_or_REST_API_Spec.md
+
+🔹 Phase 7: Governance & Documentation (Week 8)
+
+Objective: Ensure compliance, governance, and knowledge transfer.
+
+Deliverables:
+
+Data governance policy (PII, retention)
+
+Final documentation & training materials
+
+Tasks:
+
+ Identify nodes with PII data
+
+ Define data retention policies
+
+ Implement anonymization or masking
+
+ Publish project wiki and training guide
+
+Artifacts:
+
+Governance_Policy.md
+
+PII_Classification_Matrix.xlsx
+
+User_Guide_Confluence_Page
+
+🧭 High-Level Timeline
+Week	Phase	Key Deliverable
+1	Requirements & Discovery	Data Inventory
+2	Ontology Design	Approved Schema
+3	Platform Setup	Neo4j Configured
+4–5	Data Ingestion	Loaded Sample Data
+6	Graph Build & Validation	Populated Knowledge Graph
+7	Query Layer	Query Library & Dashboard
+8	Governance & Handover	Policies & Final Docs
+🧱 Roles & Responsibilities
+Role	Responsibility	Owner
+Project Lead	Overall coordination & review	[Your Name]
+Data Engineer	ETL development & validation	TBD
+Graph Architect	Ontology design, schema validation	TBD
+Analyst	Query creation, KPI validation	TBD
+DevOps	Environment setup, access control	TBD
+Compliance Lead	PII governance	TBD
+⚙️ Tools & Tech Stack
+Category	Tool
+Graph Database	Neo4j 5.x (or TigerGraph 4.x)
+ETL Framework	APOC, Python, or Airflow
+Query Language	Cypher / GraphQL
+Visualization	Neo4j Bloom, Power BI
+Documentation	Confluence, GitHub Wiki
+CI/CD	GitHub Actions / Jenkins
+📊 KPIs & Success Metrics
+KPI	Description	Target
+Graph Load Accuracy	% of records successfully mapped	≥ 98%
+Query Performance	Avg. response time for core queries	≤ 1s
+Relationship Completeness	Ratio of valid edges to expected	≥ 95%
+Ontology Adoption	Teams actively using model	≥ 3 internal teams
+Documentation Coverage	% of components documented	100%
+📚 Documentation Index
+
+📘 Ontology Design Spec
+
+📗 ETL Mapping Sheet
+
+📙 Cypher Query Library
+
+📒 Governance Policy
+
+📕 User Training & Onboarding Guide
+
+✅ Completion Criteria
+
+ Graph database deployed and accessible
+
+ Data loaded from all key sources
+
+ Queries validated with real examples
+
+ KPI dashboards operational
+
+ Governance policies approved
+
+ Documentation published in Confluence
+
+🧠 Next Steps (Post-Go-Live)
+
+Build intent drift analysis using Neo4j GDS
+
+Add LLM-based entity enrichment (NER pipeline)
+
+Integrate real-time streaming ETL (Kafka/CDC)
+
+Conduct model retraining using graph embeddings
