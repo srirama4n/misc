@@ -852,3 +852,35 @@ Add LLM-based entity enrichment (NER pipeline)
 Integrate real-time streaming ETL (Kafka/CDC)
 
 Conduct model retraining using graph embeddings
+
+
+Trivandrum
+----------
+Ginger Trivandrum - 3300
+Beach & Lake Ayurvedic Resort, Kovalam - 5000
+Ariya Nivaas_A Vegetarian Hotel - 2200
+KTDC Grand Chaithram - 3000
+HOTEL HIGHLAND - 2500
+Amara Ayurveda Retreat - 
+Uday Samudra Leisure Beach Hotel
+
+
+Varkala
+-------
+Clafouti Beach Resort - 4777
+Elixir Cliff Beach Resort And Spa Varkala -  
+Zostel Varkala - 3358
+Rachanas Black Beach Resort - 
+Cliff Stories - 
+InDa Hotel- 
+Cliff & Coral Hostel, Varkala, Odayam Beach
+Magnolia Guesthouse-Varkala resorts -
+Kerala Bamboo House -
+Sunview Beach Resort & Spa by Citrine
+
+
+
+
+
+
+
