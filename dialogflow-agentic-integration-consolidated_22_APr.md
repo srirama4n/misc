@@ -22,7 +22,7 @@ This guide covers how to bring an existing Dialogflow CX agent into a modern age
 
 ## Overall System Architecture
 
-Before getting into the integration patterns, here's the full system landscape. The actor talks to a Chat API. The Chat API publishes messages to Kafka, where a Flink-based orchestrator consumes them and decides whether to route to Dialogflow CX or the Supervisor Agent. The Supervisor has specialized sub-agents (AnswerHub, Cards Agent, Transaction Agent), each of which calls downstream FAPI APIs. Both the supervisor and sub-agents share memory tiers: Redis for short-term state and MongoDB for long-term user memory.
+Before getting into the integration patterns, here's the full system landscape. The actor talks to a Chat API. The Chat API publishes messages to Kafka, where a Flink-based orchestrator consumes them and routes to the Supervisor Agent. The Supervisor delegates to specialized sub-agents — including Dialogflow CX (wrapped as a sub-agent via the A2A adapter), plus native ADK sub-agents like AnswerHub, Cards Agent, and Transaction Agent. Each sub-agent calls the appropriate downstream system: AnswerHub queries Elasticsearch for RAG, while Dialogflow (via its webhooks), Cards, and Transaction agents call FAPI APIs for business logic. Both the supervisor and sub-agents share memory tiers: Redis for short-term working state and MongoDB for long-term user memory.
 
 ```mermaid
 flowchart TB
@@ -31,61 +31,59 @@ flowchart TB
     Kafka[(Kafka)]
     Flink[Flink Orchestrator]
 
-    subgraph DFPath[Dialogflow Path]
-        DFCX[Dialogflow CX]
-    end
-
-    subgraph AgenticPath[Agentic Path - ADK]
+    subgraph AgenticPath[ADK Agentic Path]
         Super[Supervisor Agent]
-        Adapter[A2A Adapter]
-        AH[AnswerHub Agent]
-        CA[Cards Agent]
-        TA[Transaction Agent]
+
+        subgraph DFSubAgent[Dialogflow CX Sub-Agent]
+            Adapter[A2A Adapter]
+            DFCX[Dialogflow CX<br/>Flows / Pages / Intents<br/>+ Webhooks]
+            Adapter --> DFCX
+        end
+
+        AH[AnswerHub Agent<br/>RAG / knowledge]
+        CA[Cards Agent<br/>Card operations]
+        TA[Transaction Agent<br/>Payments / transfers]
     end
 
-    subgraph Memory[Shared Memory]
-        Redis[(Redis<br/>Short-Term)]
-        Mongo[(MongoDB<br/>Long-Term)]
-    end
-
-    FAPI[FAPI APIs]
+    FAPI[FAPI APIs<br/>business logic]
+    ES[(Elasticsearch<br/>vector)]
+    Redis[(Redis<br/>short-term)]
+    Mongo[(MongoDB<br/>long-term)]
 
     Actor --> ChatAPI
     ChatAPI --> Kafka
     Kafka --> Flink
-    Flink -->|legacy flows| DFCX
-    Flink -->|new flows| Super
+    Flink --> Super
 
+    Super -.via A2A.-> Adapter
     Super --> AH
     Super --> CA
     Super --> TA
-    Super -.wraps via.-> Adapter
-    Adapter --> DFCX
 
     DFCX --> FAPI
-    AH --> FAPI
     CA --> FAPI
     TA --> FAPI
+    AH --> ES
 
-    Super <--> Redis
-    Super <--> Mongo
-    AH <--> Redis
-    CA <--> Redis
-    TA <--> Redis
-    AH <--> Mongo
-    CA <--> Mongo
-    TA <--> Mongo
+    Super <-.-> Redis
+    AH <-.-> Redis
+    CA <-.-> Redis
+    TA <-.-> Redis
+
+    Super <-.-> Mongo
+    CA <-.-> Mongo
+    TA <-.-> Mongo
 ```
 
-A few things to notice:
+A few things worth noticing:
 
-**Kafka + Flink decouples the Chat API from routing decisions.** The Chat API just publishes user messages. Flink consumes them, looks up state, and routes. This gives you a clean seam for gradual migration — you change Flink's routing rules as flows move from Dialogflow to the supervisor, and the Chat API doesn't need to know.
+**Kafka + Flink decouples the Chat API from routing decisions.** The Chat API just publishes user messages. Flink consumes them and routes to the Supervisor. This gives you a clean seam for gradual migration — Flink's routing rules are where change happens, not the Chat API.
 
-**The A2A adapter is optional.** If the supervisor needs to call legacy Dialogflow flows as a sub-agent (rather than Flink routing directly to Dialogflow), the adapter lets that happen cleanly. In pure "Flink routes to one or the other" designs, you can skip the adapter.
+**Dialogflow CX is a sub-agent, not a parallel system.** It sits alongside AnswerHub, Cards, and Transaction as one of the supervisor's sub-agents. The only difference is it needs an A2A Adapter to translate between A2A protocol and Dialogflow's native API — hence the combined "Dialogflow CX Sub-Agent" box.
 
-**Sub-agents share memory with the supervisor.** Redis for short-term working state, MongoDB for long-term user memory. Both layers are accessible to any agent that needs them, so context flows across the system.
+**Data access matches each agent's job.** AnswerHub queries Elasticsearch for RAG. Cards, Transaction, and Dialogflow's webhooks call FAPI for business logic. Agents are conversation orchestrators, not business logic containers — this separation keeps the architecture sustainable as it grows.
 
-**All agents (old and new) call FAPI APIs.** This keeps business logic in the API layer and means agents are just conversation orchestrators, not business logic containers.
+**Memory is shared but selective.** Every agent touches Redis for short-term working state (current conversation, in-flight task state). Only the agents that genuinely need cross-session user history — Cards and Transaction — also touch MongoDB. AnswerHub typically doesn't need user-specific long-term memory for RAG.
 
 ---
 
@@ -112,38 +110,34 @@ sequenceDiagram
     participant Mem as Redis + Mongo
     participant FAPI as FAPI APIs
 
-    User->>Chat: "Book a flight"
+    User->>Chat: "Transfer ₹5000 to Priya"
     Chat->>Flink: publish message
     Flink->>SM: route turn
     SM->>Mem: get conversation state
-    Mem-->>SM: state = mode:DF, flow:booking
+    Mem-->>SM: state = mode:DF, flow:transfer
     SM->>DF: detect_intent
-    DF->>FAPI: webhook call
-    FAPI-->>DF: booking data
+    DF->>FAPI: lookup payee (webhook)
+    FAPI-->>DF: payee found
     DF-->>SM: response + currentPage
     SM->>Mem: update state
-    SM-->>Flink: response
-    Flink-->>Chat: response
-    Chat-->>User: "Where would you like to fly?"
+    SM-->>Chat: response
+    Chat-->>User: "Confirm ₹5000 to Priya?"
 
-    Note over SM: Later turn — topic change detected
-    User->>Chat: "Actually, check my card balance"
+    Note over SM: Later turn — user asks something else
+    User->>Chat: "What's my card balance?"
     Chat->>Flink: publish message
     Flink->>SM: route turn
     SM->>Mem: get state + classify intent
     SM->>SM: detect mode switch needed
     SM->>Mem: checkpoint DF state
     SM->>Super: delegate new task
-    Super->>Mem: get user context
     Super->>Cards: delegate to Cards Agent
     Cards->>FAPI: get_card_balance(user_id)
     FAPI-->>Cards: balance data
-    Cards->>Mem: update short-term state
+    Cards->>Mem: update state
     Cards-->>Super: balance response
-    Super-->>SM: response
-    SM-->>Flink: response
-    Flink-->>Chat: response
-    Chat-->>User: "Your balance is..."
+    Super-->>Chat: response
+    Chat-->>User: "Your balance is ₹42,150"
 ```
 
 The state manager can be as simple or as smart as you want — keyword rules, a small classifier, or even a tiny LLM call. The key property is that it's **cheap and deterministic** for the common case, with explicit rules for mode-switching.
@@ -166,38 +160,34 @@ sequenceDiagram
     participant Mem as Redis + Mongo
     participant FAPI as FAPI APIs
 
-    User->>Chat: "Book a flight"
+    User->>Chat: "Transfer ₹5000 to Priya"
     Chat->>Flink: publish message
     Flink->>Super: route to supervisor
     Super->>Mem: get session state
-    Super->>Super: LLM decides: delegate to Dialogflow booking sub-agent
+    Super->>Super: LLM decides: delegate to DF sub-agent
     Super->>Adapter: A2A tasks/send
     Adapter->>Mem: map A2A session to DF session
     Adapter->>DF: detect_intent
-    DF->>FAPI: webhook call
-    FAPI-->>DF: booking data
+    DF->>FAPI: lookup payee (webhook)
+    FAPI-->>DF: payee found
     DF-->>Adapter: response + currentPage
     Adapter->>Adapter: translate to A2A
     Adapter-->>Super: A2A response + metadata
     Super->>Mem: update state
-    Super-->>Flink: response
-    Flink-->>Chat: response
-    Chat-->>User: "Where would you like to fly?"
+    Super-->>Chat: response
+    Chat-->>User: "Confirm ₹5000 to Priya?"
 
     Note over Super: Later — user asks about card balance
     User->>Chat: "What's my card balance?"
     Chat->>Flink: publish
     Flink->>Super: route
-    Super->>Mem: get state
     Super->>Super: LLM decides: delegate to Cards Agent (native)
     Super->>Cards: delegate task
     Cards->>FAPI: get_card_balance(user_id)
     FAPI-->>Cards: balance data
-    Cards->>Mem: update state
     Cards-->>Super: balance response
-    Super-->>Flink: response
-    Flink-->>Chat: response
-    Chat-->>User: "Your balance is..."
+    Super-->>Chat: response
+    Chat-->>User: "Your balance is ₹42,150"
 ```
 
 Key thing to notice: from the supervisor's perspective, the Dialogflow sub-agent (via A2A adapter) and the native sub-agents (Cards, AnswerHub, Transaction) look the same. The supervisor just delegates. This is what makes migration smooth — as Dialogflow flows get retired, they're replaced with native ADK sub-agents and the supervisor contract doesn't change.
@@ -221,22 +211,20 @@ sequenceDiagram
     participant Mem as Redis + Mongo
     participant FAPI as FAPI APIs
 
-    User->>Chat: "Book a flight to Paris"
+    User->>Chat: "Transfer ₹5000 to Priya"
     Chat->>Flink: publish message
     Flink->>Super: route to supervisor
     Super->>Mem: get full conversation state
     Super->>Super: LLM decides: call Dialogflow for NLU
     Super->>DFTool: query_dialogflow(text, session_id)
     DFTool->>DF: detect_intent
-    DF-->>DFTool: intent=book_flight, params
+    DF->>FAPI: lookup payee + transfer (webhook)
+    FAPI-->>DF: payee data
+    DF-->>DFTool: intent + params + result
     DFTool-->>Super: structured result
     Super->>Super: LLM plans next action
-    Super->>FAPI: call booking API directly
-    FAPI-->>Super: booking options
-    Super->>Mem: save state
-    Super-->>Flink: response
-    Flink-->>Chat: response
-    Chat-->>User: "I found these flights..."
+    Super-->>Chat: response
+    Chat-->>User: "Confirm ₹5000 to Priya?"
 
     Note over Super: Later — simple card question
     User->>Chat: "What's my card balance?"
@@ -247,14 +235,11 @@ sequenceDiagram
     Cards->>FAPI: get_card_balance(user_id)
     FAPI-->>Cards: balance data
     Cards-->>Super: balance response
-    Super-->>Flink: response
-    Flink-->>Chat: response
-    Chat-->>User: "Your balance is..."
+    Super-->>Chat: response
+    Chat-->>User: "Your balance is ₹42,150"
 ```
 
-Notice what's different here: the supervisor calls Dialogflow just for intent detection, then does all the orchestration itself — including calling FAPI APIs directly. Native sub-agents like Cards still work normally. The downside is Dialogflow's multi-turn value (slot-filling, page transitions, webhook flows) is essentially unused — you're treating it as a fancy intent classifier.
-
-This treats Dialogflow as an NLU utility rather than a conversation owner. The supervisor re-derives flow position every turn from its own state. Breaks multi-turn Dialogflow flows — slot-filling, webhooks, and page transitions depend on session continuity that this pattern doesn't preserve.
+Important detail: even in tool mode, Dialogflow's webhook still does real work — it's the one calling FAPI for the payee lookup and transfer. The supervisor treats the whole Dialogflow call as a single request/response "tool" rather than owning the conversation across turns. The downside is Dialogflow's multi-turn value (slot-filling, page transitions, stateful flow) is essentially unused — you're treating it as a one-shot intent-plus-fulfillment call.
 
 ### Example: Dialogflow CX as an ADK Sub-Agent (Native)
 
@@ -360,7 +345,7 @@ Dialogflow CX request and response:
 // Request
 {
   "queryInput": {
-    "text": {"text": "Book a flight to Paris"},
+    "text": {"text": "Transfer ₹5000 to Priya"},
     "languageCode": "en"
   },
   "session": "projects/P/locations/L/agents/A/sessions/S"
@@ -369,10 +354,10 @@ Dialogflow CX request and response:
 // Response
 {
   "queryResult": {
-    "intent": {"displayName": "book_flight"},
-    "parameters": {"destination": "Paris"},
-    "currentPage": {"displayName": "collect_dates"},
-    "responseMessages": [{"text": {"text": ["When would you like to fly?"]}}],
+    "intent": {"displayName": "transfer_money"},
+    "parameters": {"payee": "Priya", "amount": 5000},
+    "currentPage": {"displayName": "confirm_transfer"},
+    "responseMessages": [{"text": {"text": ["Confirm ₹5000 to Priya?"]}}],
     "match": {"matchType": "INTENT"}
   }
 }
@@ -390,7 +375,7 @@ A2A:
     "sessionId": "session-456",
     "message": {
       "role": "user",
-      "parts": [{"type": "text", "text": "Book a flight to Paris"}]
+      "parts": [{"type": "text", "text": "Transfer ₹5000 to Priya"}]
     }
   }
 }
@@ -400,7 +385,7 @@ A2A:
   "result": {
     "id": "task-123",
     "status": {"state": "input-required | completed | working"},
-    "artifacts": [{"parts": [{"type": "text", "text": "When would you like to fly?"}]}],
+    "artifacts": [{"parts": [{"type": "text", "text": "Confirm ₹5000 to Priya?"}]}],
     "metadata": {}
   }
 }
@@ -430,17 +415,17 @@ Four jobs.
 
 ```json
 {
-  "name": "dialogflow-booking-agent",
-  "description": "Handles flight and hotel bookings via multi-turn dialog",
+  "name": "dialogflow-banking-agent",
+  "description": "Handles money transfers and account servicing via multi-turn dialog",
   "url": "https://adapter.example.com/a2a",
   "version": "1.0.0",
   "capabilities": {"streaming": false, "pushNotifications": false},
   "skills": [
     {
-      "id": "book_flight",
-      "name": "Flight Booking",
-      "description": "Book flights with date, destination, passenger details",
-      "tags": ["booking", "travel"]
+      "id": "transfer_money",
+      "name": "Money Transfer",
+      "description": "Transfer funds to a payee with confirmation flow",
+      "tags": ["transfer", "payments"]
     }
   ]
 }
@@ -493,9 +478,9 @@ def infer_task_state(query_result):
     return "working"
 ```
 
-Design tip: build Dialogflow CX flows with explicit end pages (`booking_complete`, `booking_canceled`) so the adapter detects completion cleanly without guessing.
+Design tip: build Dialogflow CX flows with explicit end pages (`transfer_complete`, `transfer_canceled`) so the adapter detects completion cleanly without guessing.
 
-**4. Maps parameters to artifacts.** Filled slots (destination, dates, passenger count) should become A2A artifacts so the supervisor gets structured data, not just text:
+**4. Maps parameters to artifacts.** Filled slots (payee, amount, confirmation) should become A2A artifacts so the supervisor gets structured data, not just text:
 
 ```python
 def build_artifacts(query_result):
@@ -508,7 +493,7 @@ def build_artifacts(query_result):
     }]
 ```
 
-This is what makes Dialogflow genuinely useful as a sub-agent — the supervisor gets `{"destination": "Paris", "date": "2026-05-10"}` as structured output, not natural-language text it has to parse.
+This is what makes Dialogflow genuinely useful as a sub-agent — the supervisor gets `{"payee": "Priya", "amount": 5000, "confirmed": true}` as structured output, not natural-language text it has to parse.
 
 ### Adapter Skeleton
 
@@ -613,22 +598,22 @@ class SessionStore:
     "state": "input-required",
     "message": {
       "role": "agent",
-      "parts": [{"type": "text", "text": "Where would you like to fly?"}]
+      "parts": [{"type": "text", "text": "Who would you like to transfer to?"}]
     }
   },
   "history": [
     {
       "turn": 1,
-      "user_message": "I want to book a flight",
-      "agent_response": "Where would you like to fly?",
-      "df_intent": "book_flight",
-      "df_page": "collect_destination"
+      "user_message": "I want to transfer money",
+      "agent_response": "Who would you like to transfer to?",
+      "df_intent": "transfer_money",
+      "df_page": "collect_payee"
     }
   ],
   "artifacts": [],
   "metadata": {
-    "intent": "book_flight",
-    "currentPage": "collect_destination",
+    "intent": "transfer_money",
+    "currentPage": "collect_payee",
     "parameters": {}
   }
 }
@@ -717,7 +702,7 @@ Per session it stores:
 ```python
 Session(
     id="session-abc",
-    app_name="booking-app",
+    app_name="banking-assistant",
     user_id="user-123",
     state={...},          # shared state dict
     events=[...],         # full event history
@@ -830,9 +815,9 @@ return {
     "result": {
         "status": {"state": "input-required"},
         "metadata": {
-            "currentPage": "collect_destination",
-            "flowName": "flight_booking",
-            "filledParameters": {"intent": "book_flight"},
+            "currentPage": "collect_payee",
+            "flowName": "money_transfer",
+            "filledParameters": {"intent": "transfer_money"},
             "resumable": True
         }
     }
@@ -890,7 +875,7 @@ Modern agentic systems typically have three memory tiers. Each answers a differe
 
 In **short-term**, when a user is in an active Dialogflow session, `currentPage` is already in memory and the session is still alive. Nothing special needed.
 
-In **session memory**, when a user leaves mid-booking and returns 2 hours later, the Dialogflow session is gone but the last page and parameters are in your session store:
+In **session memory**, when a user leaves mid-transfer and returns 2 hours later, the Dialogflow session is gone but the last page and parameters are in your session store:
 
 ```python
 {
@@ -899,21 +884,21 @@ In **session memory**, when a user leaves mid-booking and returns 2 hours later,
   "status": "paused",
   "last_activity": "2026-04-18T10:15:00Z",
   "checkpoint": {
-    "sub_agent": "dialogflow-booking",
-    "flow": "flight_booking",
-    "page": "collect_destination",
-    "page_path": "projects/P/.../pages/collect_destination",
-    "parameters": {"intent": "book_flight", "origin": "Bengaluru"},
-    "last_message_to_user": "Where would you like to fly to?"
+    "sub_agent": "dialogflow-banking",
+    "flow": "money_transfer",
+    "page": "confirm_transfer",
+    "page_path": "projects/P/.../pages/confirm_transfer",
+    "parameters": {"intent": "transfer_money", "payee": "Priya", "amount": 5000},
+    "last_message_to_user": "Confirm ₹5000 to Priya?"
   }
 }
 ```
 
 When the user returns, the supervisor checks for paused sessions and offers to resume.
 
-In **long-term memory**, a user who started a booking three days ago on mobile and comes back today on desktop can be proactively prompted:
+In **long-term memory**, a user who started a transfer three days ago on mobile and comes back today on desktop can be proactively prompted:
 
-> *"Welcome back! You had a flight to Paris on May 10 pending confirmation. Should we finish that, or start something new?"*
+> *"Welcome back! You had a ₹5000 transfer to Priya pending confirmation. Should we finish that, or start something new?"*
 
 This is the experience that makes agentic systems feel magical rather than just functional.
 
@@ -934,9 +919,8 @@ sequenceDiagram
     Chat->>Flink: publish message
     Flink->>Super: route turn
     Super->>Mongo: get_unfinished_tasks(user_id)
-    Mongo-->>Super: flight booking paused at confirm_booking
-    Super-->>Flink: "Want to finish your Paris flight booking?"
-    Flink-->>Chat: response
+    Mongo-->>Super: transfer paused at confirm_transfer
+    Super-->>Chat: "Want to finish your ₹5000 transfer to Priya?"
     Chat-->>User: prompt
     User->>Chat: "Yes"
     Chat->>Flink: publish
@@ -945,7 +929,7 @@ sequenceDiagram
     Adapter->>Adapter: validate checkpoint freshness
     Adapter->>Redis: create new DF session mapping
     Adapter->>DF: detect_intent with currentPage + parameters
-    DF-->>Adapter: response at confirm_booking
+    DF-->>Adapter: response at confirm_transfer
     Adapter-->>Super: A2A response + status
     Super->>Mongo: update task state
     Super-->>Flink: response
@@ -1000,7 +984,7 @@ class TaskLifecycle:
     ABANDONED = "abandoned"          # User explicitly gave up
 ```
 
-Business rules decide transitions. A flight booking paused 3 days ago probably needs re-verifying prices. A support ticket paused 3 days ago can resume cleanly.
+Business rules decide transitions. A money transfer paused 3 days ago probably needs re-confirming the amount and payee details. A support ticket paused 3 days ago can resume cleanly.
 
 **Supervisor arbitrates, sub-agents execute.** The supervisor owns resume logic, not the sub-agent. The Dialogflow adapter just knows how to teleport into a page when asked. The decision of whether, which, and how to resume is supervisor-level reasoning. This keeps sub-agents simple and gives users one coherent "continue" experience regardless of which sub-agent owns the paused work.
 
@@ -1022,7 +1006,7 @@ async def greet_returning_user(user_id):
 
 ### Where It Gets Tricky
 
-**Stale data.** Parameters saved 3 days ago may be invalid today. Flight prices change, inventory moves, dates pass. Resume logic needs validation:
+**Stale data.** Parameters saved 3 days ago may be invalid today. Account balances shift, payees get removed, card status changes. Resume logic needs validation:
 
 ```python
 async def resume_with_validation(checkpoint):
@@ -1033,14 +1017,14 @@ async def resume_with_validation(checkpoint):
         checkpoint['parameters'] = validation.valid_params
         return await resume_task(checkpoint, with_reverification=True)
     else:
-        return "That booking has expired. Want to start fresh?"
+        return "That transfer request has expired. Want to start fresh?"
 ```
 
 **Multiple devices.** User starts on mobile, switches to desktop. Both might have live sessions. Long-term memory reconciles by `user_id` (not `session_id`), with latest-write-wins or explicit "you have an active session elsewhere" UX.
 
 **Privacy and retention.** Long-term memory often holds sensitive data. Apply TTL policies per data category, support user-initiated deletion, encrypt at rest, tag for compliance (GDPR right-to-be-forgotten).
 
-**Ambiguity.** User says "yes, continue." Continue what? If long-term memory has multiple unfinished tasks, the supervisor must disambiguate rather than guess. Silent guessing leads to "why did the bot just try to finish my hotel booking when I wanted the flight?" bugs.
+**Ambiguity.** User says "yes, continue." Continue what? If long-term memory has multiple unfinished tasks, the supervisor must disambiguate rather than guess. Silent guessing leads to "why did the bot just try to finish my card replacement request when I wanted to resume the transfer?" bugs.
 
 ### Why Page-Level Checkpoints Matter
 
