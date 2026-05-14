@@ -2,7 +2,7 @@
 description: Reads a vulnerability scan Excel, locates the affected code, proposes and applies fixes with rationale, and produces a remediation report.
 name: VulnFixer
 tools: ['search/codebase', 'search/usages', 'edit/applyPatch', 'vscode/runInTerminal', 'web/fetch']
-model: ['Claude Opus 4.7', 'Claude Sonnet 4.6']
+model: ['Claude Opus 4.6', 'Claude Sonnet 4.6']
 handoffs:
   - label: Run tests after fix
     agent: agent
